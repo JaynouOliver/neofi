@@ -1,5 +1,5 @@
+import os
 from datetime import datetime, timedelta, timezone
-from typing import Annotated
 from uuid import uuid4
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -9,42 +9,51 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
+from dotenv import load_dotenv
 
-# Database setup
-SQLALCHEMY_DATABASE_URL = "sqlite:///./test.db"
-engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+# Load environment variables
+load_dotenv()
+
+# Database configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://username:password@localhost:5432/neofi_db")
+engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# Database models
+# Security configuration
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secure-key-here-change-in-production")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+REFRESH_TOKEN_EXPIRE_DAYS = 7
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# Database Models
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True)
-    hashed_password = Column(String)
-    disabled = Column(Boolean, default=False)
+    username = Column(String(255), unique=True, index=True, nullable=False)
+    hashed_password = Column(String(255), nullable=False)
+    disabled = Column(Boolean, default=False, nullable=False)
 
 class RefreshToken(Base):
     __tablename__ = "refresh_tokens"
     id = Column(Integer, primary_key=True, index=True)
-    token = Column(String, unique=True, index=True)
-    username = Column(String)
+    token = Column(String(500), unique=True, index=True, nullable=False)
+    username = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 class BlacklistToken(Base):
     __tablename__ = "blacklist_tokens"
     id = Column(Integer, primary_key=True, index=True)
-    jti = Column(String, unique=True, index=True)
-    expires = Column(DateTime)
+    jti = Column(String(255), unique=True, index=True, nullable=False)
+    expires = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
+# Create tables
 Base.metadata.create_all(bind=engine)
 
-# JWT configuration
-SECRET_KEY = "your-secure-key-here"  # Generate with: openssl rand -hex 32
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
-REFRESH_TOKEN_EXPIRE_DAYS = 7
-
-# Pydantic models
+# Pydantic Models
 class UserCreate(BaseModel):
     username: str
     password: str
@@ -57,10 +66,7 @@ class Token(BaseModel):
 class RefreshRequest(BaseModel):
     refresh_token: str
 
-# Security setup
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
+# Helper Functions
 def get_db():
     db = SessionLocal()
     try:
@@ -68,24 +74,20 @@ def get_db():
     finally:
         db.close()
 
-# Helper functions
-def get_password_hash(password):
+def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
-def verify_password(plain_password, hashed_password):
+def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
-def create_token(data: dict, expires_delta: timedelta):
+def create_token(data: dict, expires_delta: timedelta) -> str:
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + expires_delta
     jti = str(uuid4())
     to_encode.update({"exp": expire, "jti": jti})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-async def get_current_user(
-    token: str = Depends(oauth2_scheme),
-    db: Session = Depends(get_db)
-):
+async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -112,7 +114,7 @@ async def get_current_user(
     except JWTError:
         raise credentials_exception
 
-# FastAPI app
+# FastAPI App
 app = FastAPI()
 
 # Endpoints
@@ -128,12 +130,8 @@ async def register(user: UserCreate, db: Session = Depends(get_db)):
     return {"message": "User created successfully"}
 
 @app.post("/token", response_model=Token)
-async def login(
-    form_data: OAuth2PasswordRequestForm = Depends(),
-    db: Session = Depends(get_db)
-):
+async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == form_data.username).first()
-    
     if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -163,10 +161,7 @@ async def login(
     }
 
 @app.post("/refresh")
-async def refresh_token(
-    request: RefreshRequest,
-    db: Session = Depends(get_db)
-):
+async def refresh_token(request: RefreshRequest, db: Session = Depends(get_db)):
     try:
         payload = jwt.decode(request.refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
         if payload.get("type") != "refresh":
@@ -210,7 +205,3 @@ async def logout(
         return {"message": "Successfully logged out"}
     except JWTError:
         raise HTTPException(status_code=400, detail="Invalid token")
-
-@app.get("/protected")
-async def protected_route(current_user: User = Depends(get_current_user)):
-    return {"message": f"Hello {current_user.username}", "status": "authenticated"}
